@@ -3,8 +3,7 @@ use crate::{WEIGHT_CASCADE_DEPTH, WEIGHT_DURATION, WEIGHT_LOCK_MODE, WEIGHT_VELO
 
 /// Squash an unbounded positive value into [0, 1] without a hard cutoff.
 /// Used for velocity and duration-overrun, where "how much" matters but
-/// we don't want one pathological outlier to blow the whole score past
-/// 1.0 and make every other signal irrelevant by comparison.
+/// one pathological outlier should not dominate the whole score.
 fn normalize(x: f64, half_point: f64) -> f64 {
     if half_point <= 0.0 {
         return 0.0;
@@ -15,20 +14,15 @@ fn normalize(x: f64, half_point: f64) -> f64 {
 
 /// Composite risk score in [0.0, 1.0].
 ///
-/// This is intentionally a transparent weighted sum, not a learned
-/// model — every term is inspectable and every weight is a GUC. The
-/// tradeoff is accuracy: a real ML model trained on your incident
-/// history would likely outperform this on precision/recall. Start
-/// here, log (score, weights, eventual outcome) into lockwatch_history,
-/// and only reach for something fancier once you have enough labeled
-/// incidents to know whether it's actually needed.
+/// Uses a transparent weighted sum rather than a learned model. Every
+/// term is inspectable and every weight is a GUC.
 pub fn score(state: &BlockerState) -> f64 {
     let now = pgrx::datum::datetime_support::clock_timestamp();
 
     let velocity = state.waiter_velocity();
     // half_point = 1.0 waiter/tick means "gaining one queued backend
-    // per sample" already counts as meaningfully risky; tune against
-    // your own sample_interval_ms.
+    // per sample" already counts as meaningfully risky. Tune against
+    // the configured sample_interval_ms.
     let velocity_term = normalize(velocity, 1.0);
 
     let hold_seconds = state.hold_seconds(now);
@@ -78,12 +72,8 @@ mod tests {
         let mut state = BlockerState {
             lock_mode: LockMode::AccessExclusive,
             baseline_hold_seconds: 0.5,
-            // A queue this size realistically isn't all queued directly
-            // on the blocker -- some of it is queued behind other
-            // waiters too (see worker.rs's wait-graph walk). cascade_depth
-            // is a real, independently-measured signal now, not derived
-            // from waiter count, so a fixture meant to exercise "this is
-            // bad" has to set it explicitly rather than get it for free.
+            // cascade_depth is measured independently from waiter count, so
+            // this fixture sets it explicitly for a high-risk queue.
             cascade_depth: 2,
             ..Default::default()
         };

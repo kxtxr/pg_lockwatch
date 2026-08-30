@@ -13,7 +13,7 @@ use shmem::LOCKWATCH_STATE;
 pgrx::pg_module_magic!();
 
 // ---------------------------------------------------------------------
-// GUCs — every tunable lives here so ops can adjust without a rebuild.
+// GUCs for runtime tuning.
 // ---------------------------------------------------------------------
 
 pub static SAMPLE_INTERVAL_MS: GucSetting<i32> = GucSetting::<i32>::new(100);
@@ -24,12 +24,11 @@ pub static HISTORY_WINDOW: GucSetting<i32> = GucSetting::<i32>::new(8);
 // A background worker connects to exactly one database for its whole life.
 // pg_locks is cluster-wide so sampling works from anywhere, but
 // lockwatch_history lives in whichever database the extension was created
-// in — point this at that database or the history inserts fail.
+// in. Point this at that database or history inserts fail.
 pub static WORKER_DATABASE: GucSetting<Option<CString>> =
     GucSetting::<Option<CString>>::new(Some(c"postgres"));
 
-// Scoring weights — kept as separate GUCs rather than one opaque struct
-// so they're individually inspectable/tunable at runtime via
+// Scoring weights are separate GUCs so each one can be inspected and tuned via
 // `ALTER SYSTEM SET lockwatch.weight_velocity = ...`.
 pub static WEIGHT_VELOCITY: GucSetting<f64> = GucSetting::<f64>::new(0.35);
 pub static WEIGHT_DURATION: GucSetting<f64> = GucSetting::<f64>::new(0.30);
@@ -37,7 +36,7 @@ pub static WEIGHT_LOCK_MODE: GucSetting<f64> = GucSetting::<f64>::new(0.20);
 pub static WEIGHT_CASCADE_DEPTH: GucSetting<f64> = GucSetting::<f64>::new(0.15);
 
 // ---------------------------------------------------------------------
-// Shared memory registration — sizes are fixed at postmaster start,
+// Shared memory registration. Sizes are fixed at postmaster start,
 // so MAX_TRACKED_BLOCKERS / HISTORY_WINDOW above are read-only after boot
 // (PGC_POSTMASTER context) even though they're declared as regular GUCs.
 // ---------------------------------------------------------------------
@@ -58,7 +57,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_float_guc(
         c"lockwatch.risk_threshold",
         c"Risk score (0.0-1.0) above which a NOTIFY is fired on the lockwatch_alert channel.",
-        c"Tune this against your own incident history rather than trusting the default.",
+        c"Tune against incident history rather than relying on the default.",
         &RISK_THRESHOLD,
         0.0,
         1.0,
@@ -69,7 +68,7 @@ pub extern "C-unwind" fn _PG_init() {
     GucRegistry::define_int_guc(
         c"lockwatch.max_tracked_blockers",
         c"Maximum number of distinct blocking PIDs tracked in shared memory.",
-        c"Fixed at postmaster start — shared memory cannot grow at runtime. Requires restart to change.",
+        c"Fixed at postmaster start. Shared memory cannot grow at runtime. Requires restart to change.",
         &MAX_TRACKED_BLOCKERS,
         8,
         512,
@@ -142,15 +141,12 @@ pub extern "C-unwind" fn _PG_init() {
     );
 
     // Shared memory must be requested in _PG_init, before shared_preload_libraries
-    // finishes loading. This is the step people forget and then wonder why
-    // their PgLwLock panics with "not initialized" at first use.
+    // finishes loading, or the PgLwLock will not be initialized.
     // Default is only derived for arrays up to 32 elements, so seed explicitly.
     pgrx::pg_shmem_init!(LOCKWATCH_STATE = [shmem::BlockerState::default(); shmem::MAX_BLOCKERS]);
 
-    // Register the sampler as a dynamic background worker that starts
-    // with the postmaster and restarts automatically if it crashes —
-    // we do NOT want a panic in scoring logic to require a full cluster
-    // restart to get monitoring back.
+    // Register the sampler as a dynamic background worker that starts with the
+    // postmaster and restarts automatically after a crash.
     BackgroundWorkerBuilder::new("pg_lockwatch sampler")
         .set_function("lockwatch_worker_main")
         .set_library("pg_lockwatch")
@@ -168,14 +164,13 @@ pub extern "C-unwind" fn lockwatch_worker_main(arg: pg_sys::Datum) {
 }
 
 // ---------------------------------------------------------------------
-// SQL-facing functions and view. pgrx generates the CREATE FUNCTION /
-// CREATE VIEW DDL for these into sql/pg_lockwatch--0.1.0.sql at build
-// time via `cargo pgrx schema` — nothing here needs hand-written SQL.
+// SQL-facing functions and view. pgrx generates the CREATE FUNCTION and
+// CREATE VIEW DDL via `cargo pgrx schema`.
 // ---------------------------------------------------------------------
 
 /// Current risk-scored snapshot of all tracked blockers, freshest first.
-/// This reads directly from shared memory — no SPI, no locking beyond
-/// the LWLock already guarding the state — so it's cheap to poll.
+/// This reads directly from shared memory with no SPI and only the LWLock
+/// already guarding the state.
 #[pg_extern]
 fn lockwatch_current_state() -> TableIterator<
     'static,
@@ -191,10 +186,8 @@ fn lockwatch_current_state() -> TableIterator<
 > {
     let snapshot = shmem::snapshot();
     TableIterator::new(snapshot.into_iter().map(|b| {
-        // Relation names aren't stored in shared memory (see the POD
-        // note on BlockerState) — resolved here via the regclass cast,
-        // which goes through Postgres's own syscache and is cheap
-        // relative to how rarely this view gets polled by a human.
+        // Relation names are not stored in shared memory; resolve them here
+        // through Postgres's regclass lookup.
         let relation_name: Option<String> = if b.relation_oid != pg_sys::InvalidOid {
             Spi::get_one_with_args("SELECT $1::regclass::text", &[b.relation_oid.into()])
                 .ok()
@@ -235,11 +228,9 @@ extension_sql!(
 );
 
 // Outcome log for the feedback loop: every time the worker fires an
-// alert, it inserts a row here. `resolved_as` starts NULL and is meant
-// to be back-filled — either by an ops person, or later by a second
-// background task that checks whether the blocking_pid eventually hit
-// a deadlock/timeout vs. resolved cleanly — so scoring weights can
-// eventually be validated against real outcomes instead of vibes.
+// alert, it inserts a row here. `resolved_as` starts NULL and can be
+// back-filled later by a process that correlates alerts with deadlocks,
+// timeouts, or clean resolution.
 extension_sql!(
     r#"
     CREATE TABLE lockwatch_history (

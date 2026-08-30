@@ -5,28 +5,24 @@ use pgrx::prelude::*;
 // IMPORTANT CAVEAT, read before changing these:
 //
 // Postgres shared memory is sized once at postmaster start and cannot
-// grow at runtime. The clean way to do that from a *runtime-read* GUC
-// value is to hand-roll a shmem_startup_hook that calls
-// pg_sys::RequestAddinShmemSpace() using the GUC's already-parsed value —
-// pgrx's `pg_shmem_init!` macro doesn't expose that hook directly, and
-// wiring it by hand needs raw pg_sys calls.
+// grow at runtime. Runtime-sized shared memory would need a
+// shmem_startup_hook that calls pg_sys::RequestAddinShmemSpace() with
+// the parsed GUC value. pgrx's `pg_shmem_init!` macro does not expose
+// that hook directly.
 //
 // For v1, capacity is a compile-time constant instead. lockwatch.max_
 // tracked_blockers and lockwatch.history_window (declared in lib.rs)
-// are honored as *soft caps within this capacity* — raise them past
-// these consts and they're clamped, not actually expanded. If you need
-// this to be genuinely runtime-configurable, that's the v2 shmem_startup_
-// hook work, not a lib.rs change.
+// are soft caps within this capacity. Raising them past these consts
+// clamps the value instead of expanding shared memory.
 // -----------------------------------------------------------------------
 
 pub const MAX_BLOCKERS: usize = 128;
 pub const HISTORY_LEN: usize = 16;
 
-// Deliberately POD (plain-old-data): no heap-backed fields (String, Vec,
-// etc). Shared memory in Postgres is a flat mmap'd region, not something
-// the allocator manages — every field here needs a size known at compile
-// time. Relation *names* are resolved from relation_oid at read time
-// (see lib.rs), not stored here, specifically to keep this true.
+// Plain-old-data only: no heap-backed fields such as String or Vec. Shared
+// memory in Postgres is a flat mmap'd region, not allocator-managed storage.
+// Every field here needs a size known at compile time. Relation names are
+// resolved from relation_oid at read time (see lib.rs).
 #[derive(Copy, Clone, Debug)]
 pub struct BlockerState {
     pub blocking_pid: i32,
@@ -85,9 +81,8 @@ pub enum LockMode {
 }
 
 impl LockMode {
-    /// Rough severity weight — how much damage this mode does to
-    /// concurrent throughput if held for a while. Tune against your own
-    /// workload; these are starting points, not physics.
+    /// Approximate severity weight for the lock mode's effect on
+    /// concurrent throughput. Tune against the target workload.
     pub fn severity(&self) -> f64 {
         match self {
             LockMode::AccessShare => 0.05,
@@ -134,8 +129,7 @@ impl BlockerState {
     }
 
     /// Waiters gained per sample tick, averaged over the recent window.
-    /// This is the actual predictive signal — a steady queue isn't the
-    /// same risk as one that's visibly accelerating.
+    /// This separates a steady queue from one that is still accelerating.
     pub fn waiter_velocity(&self) -> f64 {
         if self.history_len < 2 {
             return 0.0;
@@ -154,9 +148,8 @@ impl BlockerState {
     }
 
     /// Composite risk score in [0.0, 1.0], computed from GUC-tunable
-    /// weights. Kept as a plain weighted sum on purpose — a scoring
-    /// model ops can audit beats one that's marginally more accurate
-    /// and completely opaque.
+    /// weights. The implementation stays auditable by using a plain
+    /// weighted sum.
     pub fn risk_score(&self) -> f64 {
         crate::scoring::score(self)
     }
@@ -164,7 +157,7 @@ impl BlockerState {
 
 // A single PgLwLock guarding a fixed-size array is the simplest correct
 // approach for v1. It means every read/write serializes on one lock,
-// which is fine at our sampling frequency (10ms-10s ticks) but would
+// which is fine at the configured sampling frequency (10ms-10s ticks) but would
 // need sharding (e.g. lock-per-bucket by pid hash) if this were ever
 // pushed to sub-millisecond sampling.
 // SAFETY: unique name within this extension.
@@ -180,7 +173,7 @@ pub fn snapshot() -> Vec<BlockerState> {
 }
 
 /// Find-or-allocate a slot for a given blocking pid. Returns None if
-/// the table is full — callers should log-and-skip rather than panic;
+/// the table is full. Callers should log and skip rather than panic;
 /// a saturated tracking table means "raise lockwatch.max_tracked_blockers
 /// and restart," not a crash.
 pub fn upsert_blocker(pid: i32, f: impl FnOnce(&mut BlockerState)) -> bool {
@@ -204,9 +197,7 @@ pub fn upsert_blocker(pid: i32, f: impl FnOnce(&mut BlockerState)) -> bool {
     false // table full
 }
 
-/// Clear entries for pids that are no longer blocking anyone — called
-/// each tick before the new sample is written, so resolved contention
-/// doesn't linger in the view forever.
+/// Clear entries for pids that are no longer blocking anyone.
 pub fn evict_stale(still_blocking_pids: &[i32]) {
     let mut guard = LOCKWATCH_STATE.exclusive();
     for slot in guard.iter_mut() {

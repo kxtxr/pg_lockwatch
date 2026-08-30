@@ -4,7 +4,7 @@
 # lockwatch_history insert. Same concurrency-testing rationale as
 # lock_contention.sh, including using psql's `\t`/`\a` meta-commands
 # instead of `-tA` since `cargo pgrx connect` doesn't forward CLI flags
-# to the underlying psql process — see that file's header comment.
+# to the underlying psql process. See that file's header comment.
 #
 # USAGE:
 #   cargo pgrx run pg17          # in one terminal, leave it running
@@ -63,11 +63,9 @@ SQL
 done
 
 echo "== Listening for NOTIFY while sampling =="
-# LISTEN + sample in the same session, then check for the notification
-# via pg_notification_queue_usage as a proxy — psql's own async notice
-# printing is awkward to capture reliably in a non-interactive heredoc,
-# so this checks the queue side effect plus the durable history row
-# instead of trying to scrape "Asynchronous notification" text.
+# LISTEN + sample in the same session. psql's async notification text is
+# awkward to capture reliably in a non-interactive heredoc, so the durable
+# lockwatch_history row is the assertion here.
 #
 # Poll rather than a single fixed-delay sample: `cargo pgrx connect`'s
 # own per-invocation startup overhead means the 3 backgrounded waiters
@@ -96,7 +94,7 @@ done
 if [[ "$NEW_HISTORY_COUNT" -gt "$BASELINE_HISTORY_COUNT" ]]; then
     pass "lockwatch_history gained a row ($BASELINE_HISTORY_COUNT -> $NEW_HISTORY_COUNT)"
 else
-    fail "lockwatch_history did not grow (still $NEW_HISTORY_COUNT) — threshold may not have been crossed, or fire_alert's INSERT failed"
+    fail "lockwatch_history did not grow (still $NEW_HISTORY_COUNT); threshold may not have been crossed, or fire_alert's INSERT failed"
 fi
 
 LATEST=$("${CONNECT[@]}" <<'SQL' | tail -1

@@ -8,17 +8,12 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-/// What every lock-holding backend currently holds, at relation/tuple
-/// granularity -- independent of whether anyone is actually blocked on
-/// this specific lock row. Deliberately NOT a blocked/blocking self-join:
-/// a root blocker in a plain concurrent-UPDATE chain is waited on via a
-/// `transactionid` lock (see WAIT_GRAPH_QUERY), and that root's own
-/// relation-level lock (RowExclusiveLock, self-compatible) never
-/// conflicts with anything and so never appears as one side of a
-/// blocked/blocking pair -- a self-join here would report relation_oid
-/// = NULL for exactly the sessions we most want metadata for. Querying
-/// what a pid holds directly, rather than what it's fighting over, gets
-/// this right regardless of which lock type the actual contention is on.
+/// Relation and tuple locks currently held by each backend.
+///
+/// This is separate from the wait graph. In a concurrent UPDATE chain, a root
+/// blocker may be waited on through a transactionid lock while its relation
+/// lock is self-compatible. Reading held locks by pid still gives useful
+/// relation metadata for that root blocker.
 const HELD_LOCKS_QUERY: &str = r#"
     SELECT
         l.pid                AS pid,
@@ -33,12 +28,8 @@ const HELD_LOCKS_QUERY: &str = r#"
 
 /// Direct wait-for edges (waiter pid -> its immediate blocker pids), via
 /// `pg_blocking_pids()` rather than a hand-rolled pg_locks self-join.
-/// That builtin is what Postgres's own deadlock detector uses, so it
-/// already gets the FIFO/tuple-lock queueing nuances right that a naive
-/// self-join doesn't: e.g. three sessions running plain UPDATEs against
-/// the same row queue up as a genuine chain (A <- B <- C, D), not a star
-/// with A blocking all three -- a self-join keyed on lock identity alone
-/// mis-attributes C and D as blocked by B, not by the real root A.
+/// That builtin handles FIFO and tuple-lock queueing details that a naive
+/// pg_locks self-join can misattribute.
 /// Walking this graph below is what turns that per-hop edge list into
 /// "who's the true root, and how many total waiters sit behind it."
 const WAIT_GRAPH_QUERY: &str = r#"
@@ -72,9 +63,8 @@ pub fn main_loop(_arg: pg_sys::Datum) {
             break;
         }
         if BackgroundWorker::sighup_received() {
-            // pgrx's handler only flags ConfigReloadPending; nothing re-reads
-            // postgresql.conf for this process unless we do it. Without this
-            // the worker keeps whatever risk_threshold it booted with.
+            // pgrx's handler only flags ConfigReloadPending. This process
+            // still needs to reload postgresql.conf to pick up GUC changes.
             unsafe {
                 pg_sys::ConfigReloadPending = 0;
                 pg_sys::ProcessConfigFile(pg_sys::GucContext::PGC_SIGHUP);
@@ -98,10 +88,8 @@ pub fn sample_and_analyze() {
     let mut root_pids: Vec<i32> = Vec::new();
 
     let result = Spi::connect(|client| {
-        // A session can hold several relation/tuple locks at once (a
-        // multi-table transaction); keep whichever is most severe as the
-        // representative one, consistent with this tool scoring for the
-        // worst case rather than averaging across unrelated locks.
+        // A session can hold several relation/tuple locks at once. Keep the
+        // most severe one as the representative lock for scoring.
         let mut held: HashMap<i32, BlockerMeta> = HashMap::new();
         for row in client.select(HELD_LOCKS_QUERY, None, &[])? {
             let pid: i32 = row["pid"].value()?.unwrap_or(0);
@@ -140,8 +128,8 @@ pub fn sample_and_analyze() {
             direct_blockers.insert(pid, blockers);
         }
 
-        // Walk each waiter up to its true root blocker(s) -- a pid that
-        // holds a lock but isn't itself waiting on anything -- rather
+        // Walk each waiter up to its root blocker, a pid that
+        // holds a lock but is not itself waiting on anything, rather
         // than crediting whichever pid happens to be directly ahead of it
         // in the queue. `visited` guards against cycles: a live deadlock
         // would show up as one, and Postgres's own deadlock detector
@@ -193,11 +181,10 @@ pub fn sample_and_analyze() {
                     if b.lock_acquired_at.is_none() {
                         b.lock_acquired_at = m.held_since;
                         // Cold-start baseline: seed from current hold time so
-                        // a long-already-running query doesn't look like an
-                        // instant outlier the first time we see it. This
+                        // a long-already-running query does not look like an
+                        // instant outlier on first observation. This
                         // converges to something more meaningful over
-                        // repeated sightings of the same query_fingerprint —
-                        // see the TODO on baseline learning below.
+                        // repeated sightings of the same query_fingerprint.
                         b.baseline_hold_seconds = b
                             .hold_seconds(pgrx::datum::datetime_support::clock_timestamp())
                             .max(0.1);
@@ -270,12 +257,8 @@ fn fire_alert(blocker: &shmem::BlockerState, score: f64) {
 }
 
 fn fingerprint_query(query: &str) -> i64 {
-    // A real fingerprint should normalize literals/whitespace first
-    // (the way pg_stat_statements does) so the same query shape with
-    // different parameter values hashes identically — this is a
-    // placeholder that hashes the raw text. Swap in a proper
-    // normalizer before relying on baseline-vs-fingerprint comparisons
-    // across differently-parameterized calls of the same query.
+    // A production fingerprint should normalize literals and whitespace first,
+    // similar to pg_stat_statements. This placeholder hashes the raw text.
     let mut hasher = DefaultHasher::new();
     query.hash(&mut hasher);
     hasher.finish() as i64
