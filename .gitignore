@@ -1,4 +1,5 @@
 /target
+/dist
 *.so
 *.dylib
 *.dll

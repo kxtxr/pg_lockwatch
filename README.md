@@ -72,6 +72,25 @@ PostgreSQL datasource for the database where `pg_lockwatch` is installed.
 The dashboard reads from `lockwatch_risks` for the live snapshot and
 `lockwatch_history` for alert history.
 
+## Distribution
+
+The production workflow builds release tarballs for PostgreSQL 15, 16, 17, and
+18. It runs on pushes, pull requests, tags, and manual dispatches. Tag releases
+such as `v0.1.0` also publish the tarballs to the GitHub release.
+
+The Docker image builds from `Dockerfile` and defaults to PostgreSQL 17:
+
+```bash
+docker build -t pg_lockwatch:pg17 .
+docker run --rm -e POSTGRES_PASSWORD=postgres -p 5432:5432 pg_lockwatch:pg17
+```
+
+The image preloads `pg_lockwatch` and creates the extension in the initial
+database during first boot.
+
+On tagged releases, the workflow pushes the PostgreSQL 17 image to
+`ghcr.io/kxtxr/pg_lockwatch:pg17` and `ghcr.io/kxtxr/pg_lockwatch:<tag>-pg17`.
+
 ## Architecture
 
 - `src/lib.rs`: GUCs, shared-memory registration, background-worker startup,
