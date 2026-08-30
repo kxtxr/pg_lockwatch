@@ -19,6 +19,19 @@ use pgrx::prelude::*;
 pub const MAX_BLOCKERS: usize = 128;
 pub const HISTORY_LEN: usize = 16;
 
+/// lockwatch.max_tracked_blockers, clamped to the physical array size --
+/// the GUC can be registered up to 512 (see lib.rs) but the backing array
+/// is a fixed MAX_BLOCKERS regardless of what the GUC claims.
+fn effective_max_tracked_blockers() -> usize {
+    (crate::MAX_TRACKED_BLOCKERS.get().max(1) as usize).min(MAX_BLOCKERS)
+}
+
+/// lockwatch.history_window, clamped to the physical ring buffer size --
+/// same reasoning as effective_max_tracked_blockers.
+fn effective_history_window() -> usize {
+    (crate::HISTORY_WINDOW.get().max(1) as usize).min(HISTORY_LEN)
+}
+
 // Plain-old-data only: no heap-backed fields such as String or Vec. Shared
 // memory in Postgres is a flat mmap'd region, not allocator-managed storage.
 // Every field here needs a size known at compile time. Relation names are
@@ -38,6 +51,11 @@ pub struct BlockerState {
     /// waiter is queued directly on it). Computed each tick from a real
     /// wait-for graph walk (see worker.rs) -- not a proxy.
     pub cascade_depth: u16,
+    /// Set once an alert has fired for the current above-threshold
+    /// episode; cleared as soon as the score drops back below threshold.
+    /// Makes alerting edge-triggered (fires once per crossing) instead of
+    /// once per sample tick for as long as the blocker stays hot.
+    pub alerted: bool,
     pub in_use: bool,
 }
 
@@ -54,6 +72,7 @@ impl Default for BlockerState {
             history_len: 0,
             baseline_hold_seconds: 0.0,
             cascade_depth: 0,
+            alerted: false,
             in_use: false,
         }
     }
@@ -115,7 +134,10 @@ impl BlockerState {
     pub fn push_waiter_count(&mut self, count: u16) {
         self.waiter_history[self.history_head] = count;
         self.history_head = (self.history_head + 1) % HISTORY_LEN;
-        if self.history_len < HISTORY_LEN {
+        // Capped at the configured history window, not the full physical
+        // buffer -- this is what actually enforces lockwatch.history_window
+        // as a soft cap; the array itself always stays HISTORY_LEN long.
+        if self.history_len < effective_history_window() {
             self.history_len += 1;
         }
     }
@@ -184,6 +206,15 @@ pub fn upsert_blocker(pid: i32, f: impl FnOnce(&mut BlockerState)) -> bool {
         return true;
     }
 
+    // Enforced against the configured soft cap, not just physical
+    // capacity -- lockwatch.max_tracked_blockers otherwise has no effect
+    // at all, since every slot up to MAX_BLOCKERS would stay available
+    // regardless of what the GUC says.
+    let in_use_count = guard.iter().filter(|b| b.in_use).count();
+    if in_use_count >= effective_max_tracked_blockers() {
+        return false;
+    }
+
     if let Some(slot) = guard.iter_mut().find(|b| !b.in_use) {
         *slot = BlockerState {
             blocking_pid: pid,
@@ -195,6 +226,31 @@ pub fn upsert_blocker(pid: i32, f: impl FnOnce(&mut BlockerState)) -> bool {
     }
 
     false // table full
+}
+
+/// Blockers that just crossed above `threshold` this tick -- i.e.
+/// weren't already flagged as alerted for the current episode. Marks
+/// them alerted (so an ongoing incident doesn't re-fire every sample
+/// tick) and clears the flag for anything that dropped back below
+/// threshold, so a later re-escalation still fires.
+pub fn take_alert_transitions(threshold: f64) -> Vec<(BlockerState, f64)> {
+    let mut guard = LOCKWATCH_STATE.exclusive();
+    let mut newly_alerted = Vec::new();
+    for slot in guard.iter_mut() {
+        if !slot.in_use {
+            continue;
+        }
+        let score = slot.risk_score();
+        if score >= threshold {
+            if !slot.alerted {
+                slot.alerted = true;
+                newly_alerted.push((*slot, score));
+            }
+        } else {
+            slot.alerted = false;
+        }
+    }
+    newly_alerted
 }
 
 /// Clear entries for pids that are no longer blocking anyone.

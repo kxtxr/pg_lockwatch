@@ -8,12 +8,19 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-/// Relation and tuple locks currently held by each backend.
+/// Every lock currently held by each backend, any locktype -- advisory,
+/// object, transactionid, virtualxid included, not just relation/tuple.
+/// Excluding those types left them scored with the struct default
+/// (AccessShare, the lowest severity) whenever they were a root blocker,
+/// understating risk for exactly the kinds of locks that don't show up
+/// any other way.
 ///
-/// This is separate from the wait graph. In a concurrent UPDATE chain, a root
-/// blocker may be waited on through a transactionid lock while its relation
-/// lock is self-compatible. Reading held locks by pid still gives useful
-/// relation metadata for that root blocker.
+/// This is separate from the wait graph. In a concurrent UPDATE chain, a
+/// root blocker may be waited on through a transactionid lock while its
+/// relation lock is self-compatible. Reading held locks by pid still
+/// gives candidate relation metadata for that root blocker -- see
+/// `resolve_metadata` for how a specific candidate gets picked instead
+/// of just the most severe one a pid happens to hold.
 const HELD_LOCKS_QUERY: &str = r#"
     SELECT
         l.pid                AS pid,
@@ -23,7 +30,17 @@ const HELD_LOCKS_QUERY: &str = r#"
         act.query             AS blocking_query
     FROM pg_locks l
     JOIN pg_stat_activity act ON act.pid = l.pid
-    WHERE l.granted AND l.locktype IN ('relation', 'tuple');
+    WHERE l.granted;
+"#;
+
+/// What each waiting backend is itself blocked on -- specifically its
+/// relation, when the lock type carries one. Used to match a root
+/// blocker's *specific* contested lock (see `resolve_metadata`) instead
+/// of guessing from among everything else it happens to hold.
+const WAITER_REQUESTS_QUERY: &str = r#"
+    SELECT pid, relation AS relation_oid
+    FROM pg_locks
+    WHERE NOT granted AND pid IS NOT NULL;
 "#;
 
 /// Direct wait-for edges (waiter pid -> its immediate blocker pids), via
@@ -43,6 +60,44 @@ struct BlockerMeta {
     lock_mode: LockMode,
     held_since: Option<TimestampWithTimeZone>,
     blocking_query: Option<String>,
+}
+
+/// Pick, among everything a root blocker holds, the one that matches
+/// what's actually contested -- i.e. the relation whichever waiter is
+/// directly queued on this root is itself blocked on. Without this, a
+/// pid holding an unrelated AccessExclusiveLock on one table while
+/// blocking someone on a completely different, more weakly-locked table
+/// would report the unrelated lock, since it's simply the most severe
+/// thing that pid holds.
+///
+/// Falls back to the most severe held lock only when no exact relation
+/// match exists -- unavoidable for a transactionid-based edge (plain
+/// concurrent UPDATEs on one row), which carries no relation info at
+/// all; that fallback is a guess, not a guarantee it's the relevant lock.
+fn resolve_metadata<'a>(
+    candidates: &'a [BlockerMeta],
+    parents: &HashSet<i32>,
+    waiter_requests: &HashMap<i32, pg_sys::Oid>,
+) -> Option<&'a BlockerMeta> {
+    let contested_relations: Vec<pg_sys::Oid> = parents
+        .iter()
+        .filter_map(|p| waiter_requests.get(p))
+        .copied()
+        .filter(|&oid| oid != pg_sys::InvalidOid)
+        .collect();
+
+    let by_severity = |a: &&BlockerMeta, b: &&BlockerMeta| {
+        a.lock_mode
+            .severity()
+            .partial_cmp(&b.lock_mode.severity())
+            .unwrap()
+    };
+
+    candidates
+        .iter()
+        .filter(|c| contested_relations.contains(&c.relation_oid))
+        .max_by(by_severity)
+        .or_else(|| candidates.iter().max_by(by_severity))
 }
 
 pub fn main_loop(_arg: pg_sys::Datum) {
@@ -88,9 +143,11 @@ pub fn sample_and_analyze() {
     let mut root_pids: Vec<i32> = Vec::new();
 
     let result = Spi::connect(|client| {
-        // A session can hold several relation/tuple locks at once. Keep the
-        // most severe one as the representative lock for scoring.
-        let mut held: HashMap<i32, BlockerMeta> = HashMap::new();
+        // A session can hold several locks at once -- keep every
+        // candidate rather than collapsing to "most severe" up front, so
+        // the metadata resolved below can be matched against what's
+        // actually contested instead of just picked by severity.
+        let mut held: HashMap<i32, Vec<BlockerMeta>> = HashMap::new();
         for row in client.select(HELD_LOCKS_QUERY, None, &[])? {
             let pid: i32 = row["pid"].value()?.unwrap_or(0);
             if pid == 0 {
@@ -99,22 +156,33 @@ pub fn sample_and_analyze() {
             let relation_oid: pg_sys::Oid =
                 row["relation_oid"].value()?.unwrap_or(pg_sys::InvalidOid);
             let lock_mode_str: String = row["lock_mode"].value()?.unwrap_or_default();
-            let lock_mode = LockMode::from_pg_str(&lock_mode_str);
+            held.entry(pid).or_default().push(BlockerMeta {
+                relation_oid,
+                lock_mode: LockMode::from_pg_str(&lock_mode_str),
+                held_since: row["held_since"].value()?,
+                blocking_query: row["blocking_query"].value()?,
+            });
+        }
 
-            let is_more_severe = match held.get(&pid) {
+        // Each waiting pid's own relation, when its ungranted request has
+        // one -- prefer an entry that actually has one if a pid somehow
+        // has more than one ungranted request.
+        let mut waiter_requests: HashMap<i32, pg_sys::Oid> = HashMap::new();
+        for row in client.select(WAITER_REQUESTS_QUERY, None, &[])? {
+            let pid: i32 = row["pid"].value()?.unwrap_or(0);
+            if pid == 0 {
+                continue;
+            }
+            let relation_oid: pg_sys::Oid =
+                row["relation_oid"].value()?.unwrap_or(pg_sys::InvalidOid);
+            let is_more_informative = match waiter_requests.get(&pid) {
                 None => true,
-                Some(existing) => lock_mode.severity() > existing.lock_mode.severity(),
+                Some(&existing) => {
+                    existing == pg_sys::InvalidOid && relation_oid != pg_sys::InvalidOid
+                }
             };
-            if is_more_severe {
-                held.insert(
-                    pid,
-                    BlockerMeta {
-                        relation_oid,
-                        lock_mode,
-                        held_since: row["held_since"].value()?,
-                        blocking_query: row["blocking_query"].value()?,
-                    },
-                );
+            if is_more_informative {
+                waiter_requests.insert(pid, relation_oid);
             }
         }
 
@@ -134,20 +202,30 @@ pub fn sample_and_analyze() {
         // in the queue. `visited` guards against cycles: a live deadlock
         // would show up as one, and Postgres's own deadlock detector
         // resolves those on its own timeline, not ours.
+        //
+        // depth 0 = queued directly on the root (matches shmem.rs's
+        // documented "0 = every waiter is queued directly on it"); each
+        // further hop through an intermediate waiter adds one. `parent`
+        // tracks whichever pid's own blocked request is the edge
+        // touching the root, so its relation can be looked up afterward
+        // (see resolve_metadata) -- multiple waiters can reach the same
+        // root via different parents, so every parent seen is kept.
         let mut transitive_waiters: HashMap<i32, HashSet<i32>> = HashMap::new();
         let mut max_depth: HashMap<i32, u16> = HashMap::new();
+        let mut parents_by_root: HashMap<i32, HashSet<i32>> = HashMap::new();
 
         for (&waiter, first_hop) in &direct_blockers {
-            let mut frontier: Vec<(i32, u16)> = first_hop.iter().map(|&pid| (pid, 1)).collect();
+            let mut frontier: Vec<(i32, u16, i32)> =
+                first_hop.iter().map(|&pid| (pid, 0, waiter)).collect();
             let mut visited: HashSet<i32> = first_hop.iter().copied().collect();
             visited.insert(waiter);
 
-            while let Some((pid, depth)) = frontier.pop() {
+            while let Some((pid, depth, parent)) = frontier.pop() {
                 match direct_blockers.get(&pid) {
                     Some(next_hop) => {
                         for &next in next_hop {
                             if visited.insert(next) {
-                                frontier.push((next, depth + 1));
+                                frontier.push((next, depth + 1, pid));
                             }
                         }
                     }
@@ -158,6 +236,7 @@ pub fn sample_and_analyze() {
                         if depth > *d {
                             *d = depth;
                         }
+                        parents_by_root.entry(pid).or_default().insert(parent);
                     }
                 }
             }
@@ -167,7 +246,9 @@ pub fn sample_and_analyze() {
             root_pids.push(root_pid);
             let waiter_count = waiters.len().min(u16::MAX as usize) as u16;
             let depth = *max_depth.get(&root_pid).unwrap_or(&0);
-            let meta = held.get(&root_pid);
+            let meta = held.get(&root_pid).and_then(|candidates| {
+                resolve_metadata(candidates, &parents_by_root[&root_pid], &waiter_requests)
+            });
 
             let inserted = shmem::upsert_blocker(root_pid, |b| {
                 if let Some(m) = meta {
@@ -216,11 +297,13 @@ pub fn sample_and_analyze() {
 
 fn check_thresholds() {
     let threshold = RISK_THRESHOLD.get();
-    for blocker in shmem::snapshot() {
-        let score = blocker.risk_score();
-        if score >= threshold {
-            fire_alert(&blocker, score);
-        }
+    // Edge-triggered: fires once per crossing above threshold, not once
+    // per sample tick for as long as the blocker stays hot. At the
+    // default 100ms sample_interval_ms, a single incident that stayed
+    // over threshold for a few seconds used to produce dozens of
+    // NOTIFYs and lockwatch_history rows.
+    for (blocker, score) in shmem::take_alert_transitions(threshold) {
+        fire_alert(&blocker, score);
     }
 }
 
