@@ -64,6 +64,14 @@ instance:
 The scripts use separate `cargo pgrx connect` sessions so one backend can hold a
 lock while other backends wait behind it.
 
+## Grafana
+
+Import `grafana/pg_lockwatch-dashboard.json` into Grafana and choose the
+PostgreSQL datasource for the database where `pg_lockwatch` is installed.
+
+The dashboard reads from `lockwatch_risks` for the live snapshot and
+`lockwatch_history` for alert history.
+
 ## Architecture
 
 - `src/lib.rs`: GUCs, shared-memory registration, background-worker startup,
