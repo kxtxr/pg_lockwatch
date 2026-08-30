@@ -1,0 +1,3 @@
+[target.'cfg(target_os="macos")']
+# Postgres symbols are resolved by the postmaster at dlopen time, not at link time.
+rustflags = ["-Clink-args=-Wl,-undefined,dynamic_lookup"]

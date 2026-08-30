@@ -1,0 +1,7 @@
+# pg_lockwatch.control
+comment = 'Predictive lock-contention monitoring: scores blocking backends before they cascade'
+default_version = '0.1.0'
+module_pathname = '$libdir/pg_lockwatch'
+relocatable = false
+superuser = true
+trusted = false

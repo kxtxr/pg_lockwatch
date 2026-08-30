@@ -1,0 +1,43 @@
+[package]
+name = "pg_lockwatch"
+version = "0.1.0"
+edition = "2024"
+resolver = "3"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+default = ["pg17"]
+pg13 = ["pgrx/pg13", "pgrx-tests/pg13" ]
+pg14 = ["pgrx/pg14", "pgrx-tests/pg14" ]
+pg15 = ["pgrx/pg15", "pgrx-tests/pg15" ]
+pg16 = ["pgrx/pg16", "pgrx-tests/pg16" ]
+pg17 = ["pgrx/pg17", "pgrx-tests/pg17" ]
+pg18 = ["pgrx/pg18", "pgrx-tests/pg18" ]
+pg19 = ["pgrx/pg19", "pgrx-tests/pg19" ]
+pg_test = []
+pg_bench = ["dep:pgrx-bench"]
+
+[dependencies]
+pgrx = "=0.19.2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+heapless = "0.8"
+
+[dependencies.pgrx-bench]
+version = "=0.19.2"
+optional = true
+
+[dev-dependencies]
+[dev-dependencies.pgrx-tests]
+version = "=0.19.2"
+
+[profile.dev]
+panic = "unwind"
+
+[profile.release]
+panic = "unwind"
+opt-level = 3
+lto = "fat"
+codegen-units = 1
