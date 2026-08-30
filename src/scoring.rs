@@ -78,6 +78,13 @@ mod tests {
         let mut state = BlockerState {
             lock_mode: LockMode::AccessExclusive,
             baseline_hold_seconds: 0.5,
+            // A queue this size realistically isn't all queued directly
+            // on the blocker -- some of it is queued behind other
+            // waiters too (see worker.rs's wait-graph walk). cascade_depth
+            // is a real, independently-measured signal now, not derived
+            // from waiter count, so a fixture meant to exercise "this is
+            // bad" has to set it explicitly rather than get it for free.
+            cascade_depth: 2,
             ..Default::default()
         };
         for w in [0u16, 1, 2, 4, 6, 9] {

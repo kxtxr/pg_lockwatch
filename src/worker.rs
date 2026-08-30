@@ -8,32 +8,27 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::time::Duration;
 
-/// Metadata (relation/mode/held-since/query text) for every session that
-/// currently holds a granted lock with at least one ungranted lock of the
-/// same identity queued behind it. This is the same shape of query every
-/// pg_locks blog post uses — it tells us WHAT a candidate blocker is
-/// holding, not whether it's the *true* root of a wait chain (see
-/// WAIT_GRAPH_QUERY below for that).
-const BLOCKER_METADATA_QUERY: &str = r#"
-    SELECT DISTINCT
-        blocking.pid              AS blocking_pid,
-        blocking.relation         AS relation_oid,
-        blocking.mode             AS lock_mode,
-        blocking_act.query_start  AS held_since,
-        blocking_act.query        AS blocking_query
-    FROM pg_locks blocked
-    JOIN pg_locks blocking
-        ON blocked.locktype IS NOT DISTINCT FROM blocking.locktype
-       AND blocked.database IS NOT DISTINCT FROM blocking.database
-       AND blocked.relation IS NOT DISTINCT FROM blocking.relation
-       AND blocked.page IS NOT DISTINCT FROM blocking.page
-       AND blocked.tuple IS NOT DISTINCT FROM blocking.tuple
-       AND blocked.transactionid IS NOT DISTINCT FROM blocking.transactionid
-       AND blocked.pid != blocking.pid
-       AND blocking.granted
-    JOIN pg_stat_activity blocking_act
-        ON blocking_act.pid = blocking.pid
-    WHERE NOT blocked.granted;
+/// What every lock-holding backend currently holds, at relation/tuple
+/// granularity -- independent of whether anyone is actually blocked on
+/// this specific lock row. Deliberately NOT a blocked/blocking self-join:
+/// a root blocker in a plain concurrent-UPDATE chain is waited on via a
+/// `transactionid` lock (see WAIT_GRAPH_QUERY), and that root's own
+/// relation-level lock (RowExclusiveLock, self-compatible) never
+/// conflicts with anything and so never appears as one side of a
+/// blocked/blocking pair -- a self-join here would report relation_oid
+/// = NULL for exactly the sessions we most want metadata for. Querying
+/// what a pid holds directly, rather than what it's fighting over, gets
+/// this right regardless of which lock type the actual contention is on.
+const HELD_LOCKS_QUERY: &str = r#"
+    SELECT
+        l.pid                AS pid,
+        l.relation            AS relation_oid,
+        l.mode                AS lock_mode,
+        act.query_start       AS held_since,
+        act.query             AS blocking_query
+    FROM pg_locks l
+    JOIN pg_stat_activity act ON act.pid = l.pid
+    WHERE l.granted AND l.locktype IN ('relation', 'tuple');
 "#;
 
 /// Direct wait-for edges (waiter pid -> its immediate blocker pids), via
@@ -103,24 +98,36 @@ pub fn sample_and_analyze() {
     let mut root_pids: Vec<i32> = Vec::new();
 
     let result = Spi::connect(|client| {
-        let mut metadata: HashMap<i32, BlockerMeta> = HashMap::new();
-        for row in client.select(BLOCKER_METADATA_QUERY, None, &[])? {
-            let blocking_pid: i32 = row["blocking_pid"].value()?.unwrap_or(0);
-            if blocking_pid == 0 {
+        // A session can hold several relation/tuple locks at once (a
+        // multi-table transaction); keep whichever is most severe as the
+        // representative one, consistent with this tool scoring for the
+        // worst case rather than averaging across unrelated locks.
+        let mut held: HashMap<i32, BlockerMeta> = HashMap::new();
+        for row in client.select(HELD_LOCKS_QUERY, None, &[])? {
+            let pid: i32 = row["pid"].value()?.unwrap_or(0);
+            if pid == 0 {
                 continue;
             }
             let relation_oid: pg_sys::Oid =
                 row["relation_oid"].value()?.unwrap_or(pg_sys::InvalidOid);
             let lock_mode_str: String = row["lock_mode"].value()?.unwrap_or_default();
-            metadata.insert(
-                blocking_pid,
-                BlockerMeta {
-                    relation_oid,
-                    lock_mode: LockMode::from_pg_str(&lock_mode_str),
-                    held_since: row["held_since"].value()?,
-                    blocking_query: row["blocking_query"].value()?,
-                },
-            );
+            let lock_mode = LockMode::from_pg_str(&lock_mode_str);
+
+            let is_more_severe = match held.get(&pid) {
+                None => true,
+                Some(existing) => lock_mode.severity() > existing.lock_mode.severity(),
+            };
+            if is_more_severe {
+                held.insert(
+                    pid,
+                    BlockerMeta {
+                        relation_oid,
+                        lock_mode,
+                        held_since: row["held_since"].value()?,
+                        blocking_query: row["blocking_query"].value()?,
+                    },
+                );
+            }
         }
 
         let mut direct_blockers: HashMap<i32, Vec<i32>> = HashMap::new();
@@ -172,7 +179,7 @@ pub fn sample_and_analyze() {
             root_pids.push(root_pid);
             let waiter_count = waiters.len().min(u16::MAX as usize) as u16;
             let depth = *max_depth.get(&root_pid).unwrap_or(&0);
-            let meta = metadata.get(&root_pid);
+            let meta = held.get(&root_pid);
 
             let inserted = shmem::upsert_blocker(root_pid, |b| {
                 if let Some(m) = meta {
