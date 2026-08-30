@@ -1,0 +1,231 @@
+name: production
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      publish_image:
+        description: "Push the Docker image to GHCR"
+        required: false
+        type: boolean
+        default: false
+
+env:
+  EXTENSION_NAME: pg_lockwatch
+  PGRX_VERSION: 0.19.2
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  validate:
+    name: validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Add PostgreSQL apt repository
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+
+      - name: Install PostgreSQL 17 build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            libclang-dev \
+            pkg-config \
+            postgresql-17 \
+            postgresql-server-dev-17
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Initialize pgrx for PostgreSQL 17
+        run: cargo pgrx init --pg17 /usr/lib/postgresql/17/bin/pg_config
+
+      - name: Check Rust build
+        run: cargo check --no-default-features --features pg17
+
+      - name: Validate Grafana dashboard
+        run: jq empty grafana/pg_lockwatch-dashboard.json
+
+  package:
+    name: package pg${{ matrix.pg_major }}
+    runs-on: ubuntu-latest
+    needs: validate
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major:
+          - 15
+          - 16
+          - 17
+          - 18
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: pg${{ matrix.pg_major }}
+
+      - name: Add PostgreSQL apt repository
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ca-certificates curl gnupg
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc \
+            | sudo gpg --dearmor -o /usr/share/keyrings/postgresql.gpg
+          . /etc/os-release
+          echo "deb [signed-by=/usr/share/keyrings/postgresql.gpg] https://apt.postgresql.org/pub/repos/apt ${VERSION_CODENAME}-pgdg main" \
+            | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+
+      - name: Install PostgreSQL build dependencies
+        run: |
+          set -euo pipefail
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            clang \
+            libclang-dev \
+            pkg-config \
+            postgresql-${{ matrix.pg_major }} \
+            postgresql-server-dev-${{ matrix.pg_major }}
+
+      - name: Install cargo-pgrx
+        run: cargo install cargo-pgrx --version "$PGRX_VERSION" --locked
+
+      - name: Initialize pgrx for PostgreSQL ${{ matrix.pg_major }}
+        run: |
+          set -euo pipefail
+          PG_CONFIG="/usr/lib/postgresql/${{ matrix.pg_major }}/bin/pg_config"
+          cargo pgrx init "--pg${{ matrix.pg_major }}" "$PG_CONFIG"
+
+      - name: Build production package
+        run: |
+          set -euo pipefail
+          PG_MAJOR="${{ matrix.pg_major }}"
+          PG_CONFIG="/usr/lib/postgresql/${PG_MAJOR}/bin/pg_config"
+          VERSION="${GITHUB_REF_NAME:-${GITHUB_SHA::12}}"
+          VERSION="${VERSION//\//-}"
+          PACKAGE_DIR="dist/package/pg${PG_MAJOR}"
+          STAGE_DIR="dist/archive/${EXTENSION_NAME}-pg${PG_MAJOR}-linux-amd64"
+          ARCHIVE="dist/${EXTENSION_NAME}-${VERSION}-pg${PG_MAJOR}-linux-amd64.tar.gz"
+
+          cargo pgrx package \
+            --no-default-features \
+            --features "pg${PG_MAJOR}" \
+            --pg-config "$PG_CONFIG" \
+            --out-dir "$PACKAGE_DIR"
+
+          mkdir -p "$STAGE_DIR/usr/share/doc/${EXTENSION_NAME}/grafana"
+          cp -a "$PACKAGE_DIR/." "$STAGE_DIR/"
+          cp README.md "$STAGE_DIR/usr/share/doc/${EXTENSION_NAME}/README.md"
+          cp grafana/pg_lockwatch-dashboard.json "$STAGE_DIR/usr/share/doc/${EXTENSION_NAME}/grafana/"
+          tar -czf "$ARCHIVE" -C "$STAGE_DIR" .
+
+      - name: Upload package artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.EXTENSION_NAME }}-pg${{ matrix.pg_major }}-linux-amd64
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  docker:
+    name: docker pg${{ matrix.pg_major }}
+    runs-on: ubuntu-latest
+    needs: validate
+
+    strategy:
+      fail-fast: false
+      matrix:
+        pg_major:
+          - 17
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute image name
+        id: image
+        run: echo "name=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: startsWith(github.ref, 'refs/tags/') || github.event.inputs.publish_image == 'true'
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build Docker image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile
+          build-args: |
+            PG_MAJOR=${{ matrix.pg_major }}
+            PGRX_VERSION=${{ env.PGRX_VERSION }}
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          tags: |
+            ${{ steps.image.outputs.name }}:pg${{ matrix.pg_major }}
+            ${{ steps.image.outputs.name }}:${{ github.ref_name }}-pg${{ matrix.pg_major }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') || github.event.inputs.publish_image == 'true' }}
+          load: ${{ !(startsWith(github.ref, 'refs/tags/') || github.event.inputs.publish_image == 'true') }}
+
+  github-release:
+    name: github release
+    runs-on: ubuntu-latest
+    needs:
+      - package
+      - docker
+    if: startsWith(github.ref, 'refs/tags/')
+
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/*.tar.gz --clobber
+          else
+            gh release create "$TAG" dist/*.tar.gz --title "$TAG" --generate-notes
+          fi

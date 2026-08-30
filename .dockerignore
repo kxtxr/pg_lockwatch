@@ -1,0 +1,8 @@
+target
+dist
+.git
+.github
+.DS_Store
+*.so
+*.dylib
+*.dll
